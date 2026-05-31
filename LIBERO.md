@@ -41,7 +41,11 @@ We trained Cosmos Policy on four LIBERO task suites altogether in one run: LIBER
 
 To start evaluations with this checkpoint, run the command below, where `task_suite_name` is one of the following: `libero_spatial`, `libero_object`, `libero_goal`, `libero_10`. Each will automatically download the checkpoint above. You can set the `TRANSFORMERS_CACHE` and `HF_HOME` environment variable to change where the checkpoint files get cached.
 
+
+### Policy Mode 
+
 ```bash
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
 uv run --extra cu128 --group libero --python 3.10 \
   python -m cosmos_policy.experiments.robot.libero.run_libero_eval \
     --config cosmos_predict2_2b_480p_libero__inference_only \
@@ -60,7 +64,7 @@ uv run --extra cu128 --group libero --python 3.10 \
     --local_log_dir cosmos_policy/experiments/robot/libero/logs/ \
     --randomize_seed False \
     --data_collection False \
-    --available_gpus "0,1,2,3,4,5,6,7" \
+    --available_gpus "0,1" \
     --seed 195 \
     --use_variance_scale False \
     --deterministic True \
@@ -74,7 +78,50 @@ uv run --extra cu128 --group libero --python 3.10 \
     --num_denoising_steps_value 1
 ```
 
+### Planning Mode (with future image predictions)
+
+```bash
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+uv run --extra cu128 --group libero --python 3.10 \
+  python -m cosmos_policy.experiments.robot.libero.run_libero_eval \
+    --config cosmos_predict2_2b_480p_libero__inference_only \
+    --ckpt_path nvidia/Cosmos-Policy-LIBERO-Predict2-2B \
+    --config_file cosmos_policy/config/config.py \
+    --use_wrist_image True \
+    --use_proprio True \
+    --normalize_proprio True \
+    --unnormalize_actions True \
+    --dataset_stats_path nvidia/Cosmos-Policy-LIBERO-Predict2-2B/libero_dataset_statistics.json \
+    --t5_text_embeddings_path nvidia/Cosmos-Policy-LIBERO-Predict2-2B/libero_t5_embeddings.pkl \
+    --trained_with_image_aug True \
+    --chunk_size 16 \
+    --num_open_loop_steps 16 \
+    --task_suite_name libero_10 \
+    --local_log_dir cosmos_policy/experiments/robot/libero/logs/ \
+    --randomize_seed False \
+    --data_collection False \
+    --available_gpus "4,5,6" \
+    --seed 195 \
+    --use_variance_scale False \
+    --deterministic True \
+    --run_id_note chkpt45000--planning--bo4--failonly \
+    --ar_future_prediction True \
+    --ar_value_prediction True \
+    --num_queries_best_of_n 4 \
+    --use_parallel_inference True \
+    --use_jpeg_compression True \
+    --flip_images True \
+    --num_denoising_steps_action 5 \
+    --num_denoising_steps_future_state 1 \
+    --num_denoising_steps_value 1 \
+    --save_planning_video True \
+    --episodes_csv exp/fail_tasks.csv
+```
+
+
 Notes:
+* `--use_parallel_inference True` will speed up inference by running multiple parallel forward passes to evaluate different candidate action sequences at the same time. This is especially important for the planning mode since it needs to evaluate multiple candidate action sequences (e.g. `--num_queries_best_of_n 4`) to choose the best one.
+* `save_planning_video` for the planning mode, will save videos of all planning trajectories.
 * The evaluation script will run 500 trials by default (10 tasks x 50 episodes each). You can modify the number of trials per task by setting `--num_trials_per_task`. Note that the `--seed` and `--deterministic` arguments are important if you want to exactly reproduce the results in the Cosmos Policy paper. We used seeds {195, 196, 197} and `--deterministic True`. You can change these, but the results may vary slightly (and change every time you run the evaluation).
 * The evaluation script logs results locally. You can also log results in Weights & Biases by setting `--use_wandb True` and specifying `--wandb_entity <ENTITY>` and `--wandb_project <PROJECT>`.
 * The results reported in our paper were obtained using **Python 3.12.3 (and 3.10.18) and PyTorch 2.7.0** on an **NVIDIA H100 GPU**, averaged over three random seeds. Note that results may vary slightly if you use a different PyTorch version or different hardware.
@@ -101,3 +148,16 @@ This command will train with effective batch size = (local batch size) * (# GPUs
 You can modify various experiment config variables in `cosmos_policy/config/experiment/cosmos_policy_experiment_configs.py`. Alternatively, you can change variables on the command line. For example, appending `dataloader_train.batch_size=4` to the command above sets the local batch size (per GPU) to 4.
 
 In general, we recommend training until action L1 loss reaches around ~0.010. (We observed ~0.012 L1 loss after 40K gradient steps using 8 nodes (64 H100s) and no gradient accumulation -- i.e., same command as above except after removing `trainer.grad_accum_iter=8`.) Please be sure to test your policy with the same device/GPU used to train it! Otherwise, performance may drop substantially.
+
+# Libero-plus
+
+1. Add `libero = { path = "LIBERO-plus", editable = true }` to `pyproject.toml` to enable imports from the `LIBERO-plus` directory.
+2. Edit `~/.libero/config.yaml` to add the following config for the modified LIBERO datasets:
+3. Fix wand issues 
+
+```bash
+export MAGICK_HOME=/home/data/wanshan/miniforge3/envs/magick
+export LD_LIBRARY_PATH=/home/data/wanshan/miniforge3/envs/magick/lib:$LD_LIBRARY_PATH
+```
+
+

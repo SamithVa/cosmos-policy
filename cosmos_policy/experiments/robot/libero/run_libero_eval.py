@@ -106,6 +106,7 @@ Usage examples:
 
 """
 
+import csv
 import json
 import logging
 import os
@@ -142,6 +143,7 @@ from cosmos_policy.experiments.robot.libero.libero_utils import (
     get_libero_env,
     get_libero_image,
     get_libero_wrist_image,
+    save_planning_candidates_video,
     save_rollout_video,
     save_rollout_video_with_future_image_predictions,
 )
@@ -233,6 +235,7 @@ class PolicyEvalConfig:
     mask_future_state_for_qvalue_prediction: bool = False                # Whether to use input masking to mask out certain inputs (future state) during Q(s, a) value prediction
 
     num_queries_best_of_n: int = 1                                       # Number of queries to make to the model (this is the N in best-of-N search)
+    save_planning_video: bool = False                                    # If True, save a video showing all best-of-N planning candidates' predicted future images and values per step
     use_parallel_inference: bool = False                                 # Whether to use parallel inference across multiple GPUs
     available_gpus: str = "0,1,2,3,4,5,6,7"                              # Comma-separated list of GPU IDs available for use for parallel inference (defaults to all 8 GPUs on a node)
     parallel_timeout: int = 15                                           # Timeout in seconds for each parallel query
@@ -242,6 +245,7 @@ class PolicyEvalConfig:
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL                      # Task suite (must be one of: LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_10, LIBERO_90)
     num_trials_per_task: int = 50                                        # Number of rollouts per task
+    episodes_csv: str = ""                                               # Optional path to a CSV with `task_id,episode_idx` columns; if set, only those (task, episode) pairs are run
     initial_states_path: str = "DEFAULT"                                 # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                                               # Resolution for rendering environment images (not policy input resolution)
 
@@ -376,6 +380,7 @@ def run_episode(
     replay_images = []
     replay_wrist_images = [] if cfg.use_wrist_image else None
     future_image_predictions_list = []
+    planning_candidates_list = []  # Per-requery-step record of all best-of-N candidates (future images + values)
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # Best-of-N search variables
@@ -575,6 +580,29 @@ def run_episode(
                         f"Query {query_idx + 1}/{num_queries} (seed {cfg.seed + query_idx}): Predicted value = {predicted_value:.4f}",
                         log_file,
                     )
+
+                # Diagnostic: measure how different the candidates actually are (action & future image)
+                if cfg.save_planning_video and len(query_results) > 1:
+
+                    def _l2(a, b):
+                        a = np.asarray(a, dtype=np.float32)
+                        b = np.asarray(b, dtype=np.float32)
+                        return float(np.sqrt(np.mean((a - b) ** 2)))
+
+                    ref = query_results[0]
+                    for query_idx, return_dict in enumerate(query_results[1:], start=1):
+                        action_l2 = _l2(return_dict["actions"], ref["actions"])
+                        ref_primary = ref["future_image_predictions"].get("future_image")
+                        cand_primary = return_dict["future_image_predictions"].get("future_image")
+                        ref_wrist = ref["future_image_predictions"].get("future_wrist_image")
+                        cand_wrist = return_dict["future_image_predictions"].get("future_wrist_image")
+                        primary_l2 = _l2(cand_primary, ref_primary) if ref_primary is not None else float("nan")
+                        wrist_l2 = _l2(cand_wrist, ref_wrist) if ref_wrist is not None else float("nan")
+                        log_message(
+                            f"t={t}: Query {query_idx + 1} vs Query 1 RMSE -- action={action_l2:.5f}, "
+                            f"future_primary={primary_l2:.3f}, future_wrist={wrist_l2:.3f} (pixels 0-255)",
+                            log_file,
+                        )
                 # Get dict: seed number -> (action chunk, future state, value)
                 seed_to_return_dict = {
                     cfg.seed + query_idx: (
@@ -593,6 +621,24 @@ def run_episode(
                 action_queue.extend(best_actions)
                 future_image_predictions_list.append(best_future_predictions)
                 log_message(f"t={t}: Selected seed {best_seed} with value = {best_value_predictions:.4f}", log_file)
+
+                # Record all best-of-N candidates (future images + values) for this requery step
+                if cfg.save_planning_video:
+                    candidates = []
+                    for query_idx, return_dict in enumerate(query_results):
+                        future_preds = return_dict["future_image_predictions"]
+                        value = return_dict["value_prediction"]
+                        candidates.append(
+                            {
+                                "seed": cfg.seed + query_idx,
+                                "value": float(value),
+                                "future_image": future_preds.get("future_image"),
+                                "future_wrist_image": future_preds.get("future_wrist_image"),
+                            }
+                        )
+                    planning_candidates_list.append(
+                        {"t": t, "candidates": candidates, "best_index": best_seed - cfg.seed}
+                    )
 
             # Get action from queue
             action = action_queue.popleft()
@@ -643,7 +689,35 @@ def run_episode(
     else:
         collected_data = None
 
-    return success, replay_images, replay_wrist_images, future_image_predictions_list, collected_data
+    return (
+        success,
+        replay_images,
+        replay_wrist_images,
+        future_image_predictions_list,
+        planning_candidates_list,
+        collected_data,
+    )
+
+
+def load_episode_filter(episodes_csv: str) -> dict:
+    """Parse a CSV with `task_id,episode_idx` columns into {task_id: sorted[episode_idx]}.
+
+    Only those (task, episode) pairs will be run. Any extra columns (e.g. the
+    `global_episode`, `task`, `video` columns produced by exp/find_fail.py) are ignored.
+    """
+    episode_filter: dict = {}
+    with open(episodes_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or "task_id" not in reader.fieldnames or "episode_idx" not in reader.fieldnames:
+            raise ValueError(
+                f"{episodes_csv} must have a header with 'task_id' and 'episode_idx' columns; "
+                f"found: {reader.fieldnames}"
+            )
+        for row in reader:
+            task_id = int(row["task_id"])
+            episode_idx = int(row["episode_idx"])
+            episode_filter.setdefault(task_id, set()).add(episode_idx)
+    return {task_id: sorted(idxs) for task_id, idxs in episode_filter.items()}
 
 
 def run_task(
@@ -658,8 +732,14 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    episode_indices=None,
 ):
-    """Run evaluation for a single task."""
+    """Run evaluation for a single task.
+
+    If `episode_indices` is provided, only those per-task episode indices are run
+    (and rollout videos are named with the original global episode number so they
+    line up with the source CSV); otherwise all `num_trials_per_task` episodes run.
+    """
     # Get task
     task = task_suite.get_task(task_id)
 
@@ -670,9 +750,18 @@ def run_task(
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
 
     # Start episodes
+    episodes_to_run = episode_indices if episode_indices is not None else range(cfg.num_trials_per_task)
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    for episode_idx in tqdm.tqdm(episodes_to_run):
         log_message(f"\nTask: {task_description}", log_file)
+
+        # When filtering to specific episodes, name videos with the original global
+        # episode number (matches default unfiltered numbering) for traceability.
+        video_idx = (
+            task_id * cfg.num_trials_per_task + episode_idx + 1
+            if episode_indices is not None
+            else total_episodes + 1
+        )
 
         # Handle initial state
         if cfg.initial_states_path == "DEFAULT":
@@ -694,7 +783,14 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images, replay_wrist_images, future_image_predictions_list, collected_data = run_episode(
+        (
+            success,
+            replay_images,
+            replay_wrist_images,
+            future_image_predictions_list,
+            planning_candidates_list,
+            collected_data,
+        ) = run_episode(
             cfg,
             env,
             task_description,
@@ -717,7 +813,7 @@ def run_task(
         # Save replay video
         save_rollout_video(
             replay_images,
-            total_episodes,
+            video_idx,
             success=success,
             task_description=task_description,
             log_file=log_file,
@@ -732,7 +828,7 @@ def run_task(
             future_wrist_image_predictions = [x["future_wrist_image"] for x in future_image_predictions_list]
         save_rollout_video_with_future_image_predictions(
             replay_images,
-            total_episodes,
+            video_idx,
             success=success,
             task_description=task_description,
             chunk_size=cfg.chunk_size,
@@ -744,12 +840,22 @@ def run_task(
             show_diff=False,
         )
 
+        # Save planning video: all best-of-N candidates with their predicted values per step
+        if cfg.save_planning_video and len(planning_candidates_list) > 0:
+            save_planning_candidates_video(
+                planning_candidates_list,
+                video_idx,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+            )
+
         # Save episodic data (in data collection mode)
         if cfg.data_collection and collected_data is not None:
 
             def _save_episode_data():
                 """Save collected episode data to HDF5 file."""
-                ep_filename = f"episode_data--suite={cfg.task_suite_name}--{DATE_TIME}--task={task_id}--ep={total_episodes}--success={success}--{cfg.run_id_note}.hdf5"
+                ep_filename = f"episode_data--suite={cfg.task_suite_name}--{DATE_TIME}--task={task_id}--ep={video_idx}--success={success}--{cfg.run_id_note}.hdf5"
                 rollout_data_dir = os.path.join(cfg.local_log_dir, "rollout_data")
                 os.makedirs(rollout_data_dir, exist_ok=True)
                 ep_filepath = os.path.join(rollout_data_dir, ep_filename)
@@ -896,9 +1002,22 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
     log_message(f"Number of tasks: {num_tasks}", log_file)
 
+    # Optionally restrict evaluation to specific (task_id, episode_idx) pairs from a CSV
+    episode_filter = None
+    if cfg.episodes_csv:
+        episode_filter = load_episode_filter(cfg.episodes_csv)
+        num_pairs = sum(len(v) for v in episode_filter.values())
+        log_message(
+            f"Episode filter active ({cfg.episodes_csv}): running {num_pairs} episodes "
+            f"across {len(episode_filter)} tasks: "
+            f"{ {k: v for k, v in sorted(episode_filter.items())} }",
+            log_file,
+        )
+
     # Start evaluation
+    task_ids = sorted(episode_filter) if episode_filter is not None else range(num_tasks)
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    for task_id in tqdm.tqdm(task_ids):
         (
             total_episodes,
             total_successes,
@@ -914,6 +1033,7 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            episode_indices=episode_filter[task_id] if episode_filter is not None else None,
         )
 
     # Calculate final success rate

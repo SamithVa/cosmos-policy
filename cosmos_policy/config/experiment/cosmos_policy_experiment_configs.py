@@ -23,6 +23,7 @@ from cosmos_policy._src.imaginaire.lazy_config import LazyDict
 from cosmos_policy._src.imaginaire.utils import log
 from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path  # noqa: F401
 from cosmos_policy.datasets.aloha_dataset import ALOHADataset
+from cosmos_policy.datasets.lerobot_dataset import LeRobotPolicyDataset
 from cosmos_policy.datasets.libero_dataset import LIBERODataset
 from cosmos_policy.datasets.robocasa_dataset import RoboCasaDataset
 from cosmos_policy.models.policy_video2world_model import CosmosPolicyVideo2WorldModel
@@ -285,6 +286,72 @@ cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference = LazyDict(
 )
 
 
+# *** LeRobot (HF Hub) fine-tuning ***
+_LEROBOT_REPO_ID = "jokeru/record_p3_orange_1"
+_LEROBOT_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "cosmos_policy", "lerobot", _LEROBOT_REPO_ID.replace("/", "__")
+)
+lerobot_orange_dataset = L(LeRobotPolicyDataset)(
+    repo_id=_LEROBOT_REPO_ID,
+    t5_text_embeddings_path=os.path.join(_LEROBOT_CACHE_DIR, "t5_embeddings.pkl"),
+    chunk_size=16,
+    use_image_aug=True,
+    use_wrist_images=True,
+    use_third_person_images=True,
+    use_proprio=True,
+    normalize_proprio=True,
+    normalize_actions=True,
+    num_duplicates_per_image=4,  # WAN 2.1 tokenizer: 4 images per latent frame
+    use_stronger_image_aug=True,
+    return_value_function_returns=True,  # needed to emit the value latent (state_t=11); value loss masked for demos
+    gamma=0.99,
+)
+cosmos_predict2_2b_480p_lerobot = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_libero",
+            "_self_",
+        ],
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                state_t=11,  # blank, proprio, wrist, primary, secondary, action, future proprio, future wrist, future primary, future secondary, value
+                min_num_conditional_frames=5,  # 1 blank, 4 conditioning (proprio, wrist, primary, secondary)
+                max_num_conditional_frames=5,  # 1 blank, 4 conditioning (proprio, wrist, primary, secondary)
+                tokenizer=dict(
+                    chunk_duration=41,  # 1 blank + 40 images (4 each: proprio, wrist, primary, secondary, action, future proprio, future wrist, future primary, future secondary, value)
+                ),
+            ),
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=8,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=lerobot_orange_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=lerobot_orange_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=16,
+            drop_last=True,
+        ),
+        # Warm-start from the Cosmos-Policy LIBERO checkpoint (already trained for action/proprio/value
+        # latent injection) instead of the raw 2B Video2World base. strict_resume=False (inherited)
+        # lets shape-mismatched tensors (proprio embedder 9->7, T-sized temporal embeds for state_t 9->11,
+        # the extra secondary-image slot) reinit while the 2B transformer body transfers.
+        checkpoint=dict(
+            load_path=get_checkpoint_path("hf://nvidia/Cosmos-Policy-LIBERO-Predict2-2B/Cosmos-Policy-LIBERO-Predict2-2B.pt"),
+        ),
+        job=dict(
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_lerobot",
+        ),
+    )
+)
+
+
 # *** Main checkpoint ***
 aloha_cosmos_policy_dataset_185_demos = L(ALOHADataset)(
     data_dir=os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed"),
@@ -472,6 +539,8 @@ def register_configs():
         # RoboCasa
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference,
+        # LeRobot (HF Hub)
+        cosmos_predict2_2b_480p_lerobot,
         # ALOHA
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80__inference_only,

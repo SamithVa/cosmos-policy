@@ -33,6 +33,13 @@ def get_libero_env(task, model_family, resolution=256):
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
+    # LIBERO-plus encodes perturbation params (e.g. "_view_0_0_100_2_6_initstate_0") into the task
+    # name, and task.language joins those tokens into the instruction string. Prefer the clean
+    # instruction parsed from the (base) BDDL so the policy gets correct language conditioning and
+    # the T5 embedding cache (libero_t5_embeddings.pkl) hits instead of recomputing. For the
+    # language-perturbation category this is the rewritten instruction from the BDDL (also correct).
+    if getattr(env, "language_instruction", None):
+        task_description = env.language_instruction
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
@@ -71,6 +78,117 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     print(f"Saved rollout MP4 at path {mp4_path}")
     if log_file is not None:
         log_file.write(f"Saved rollout MP4 at path {mp4_path}\n")
+    return mp4_path
+
+
+def save_planning_candidates_video(
+    planning_candidates_list,
+    idx,
+    success,
+    task_description,
+    fps=2,
+    log_file=None,
+):
+    """Saves an MP4 visualizing best-of-N planning per requery step.
+
+    Each video frame corresponds to one requery step and shows the N candidates as columns.
+    Each column has two rows of predicted future images -- wrist camera on top and primary
+    camera below -- annotated with the candidate's predicted value. The selected
+    (highest-value) candidate is outlined in green.
+
+    Args:
+        planning_candidates_list: list of per-step dicts, each with keys
+            "t" (int), "best_index" (int), and "candidates" (list of dicts with
+            "seed", "value", "future_image", "future_wrist_image").
+    """
+    rollout_dir = f"./rollouts/{DATE}"
+    os.makedirs(rollout_dir, exist_ok=True)
+    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:35]
+    mp4_path = f"{rollout_dir}/{DATE_TIME}--planning--episode={idx}--success={success}--task={processed_task_description}.mp4"
+
+    label_h = 28  # Height of the per-candidate value label strip
+    border = 4  # Border thickness for the selected candidate
+    pad = 6  # Padding between cells
+    row_gap = 4  # Vertical gap between wrist and primary rows
+
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    def _to_uint8(img):
+        if img is None:
+            return None
+        if not isinstance(img, np.ndarray):
+            img = np.asarray(img)
+        return img.astype(np.uint8)
+
+    video_writer = imageio.get_writer(mp4_path, fps=fps)
+    for step in planning_candidates_list:
+        candidates = step["candidates"]
+        best_index = step["best_index"]
+
+        # Collect (wrist, primary) image pair and value for each candidate
+        cells = []
+        for cand in candidates:
+            wrist = _to_uint8(cand["future_wrist_image"])
+            primary = _to_uint8(cand["future_image"])
+            if wrist is None and primary is None:
+                continue
+            cells.append((wrist, primary, cand["value"]))
+        if len(cells) == 0:
+            continue
+
+        # Determine a common cell size from the first available image
+        ref = cells[0][0] if cells[0][0] is not None else cells[0][1]
+        cell_h, cell_w = ref.shape[:2]
+
+        has_wrist = any(c[0] is not None for c in cells)
+        has_primary = any(c[1] is not None for c in cells)
+        num_rows = int(has_wrist) + int(has_primary)
+
+        full_h = label_h + num_rows * cell_h + (num_rows - 1) * row_gap
+        full_w = len(cells) * cell_w + (len(cells) + 1) * pad
+        canvas = Image.new("RGB", (full_w, full_h), color=(20, 20, 20))
+        draw = ImageDraw.Draw(canvas)
+
+        def _paste(arr, x0, y0):
+            if arr is None:
+                return
+            pil = Image.fromarray(arr)
+            if pil.size != (cell_w, cell_h):
+                pil = pil.resize((cell_w, cell_h), Image.LANCZOS)
+            canvas.paste(pil, (x0, y0))
+
+        for col, (wrist, primary, value) in enumerate(cells):
+            x0 = pad + col * (cell_w + pad)
+            y = label_h
+            if has_wrist:
+                _paste(wrist, x0, y)
+                y += cell_h + row_gap
+            if has_primary:
+                _paste(primary, x0, y)
+
+            # Value label centered above the column
+            is_best = col == best_index
+            color = (0, 230, 0) if is_best else (220, 220, 220)
+            text = f"v={value:.3f}" + (" *" if is_best else "")
+            tw = draw.textlength(text, font=font)
+            draw.text((x0 + (cell_w - tw) / 2, 4), text, fill=color, font=font)
+
+            # Outline the selected candidate (spanning both rows)
+            if is_best:
+                draw.rectangle(
+                    [x0 - border, label_h - 1, x0 + cell_w + border - 1, full_h - 1],
+                    outline=(0, 230, 0),
+                    width=border,
+                )
+
+        video_writer.append_data(np.array(canvas))
+    video_writer.close()
+    print(f"Saved planning candidates MP4 at path {mp4_path}")
+    if log_file is not None:
+        log_file.write(f"Saved planning candidates MP4 at path {mp4_path}\n")
     return mp4_path
 
 

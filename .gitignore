@@ -1,2 +1,23 @@
 /.cuda-name
 /build
+
+/LIBERO-Cosmos-Policy/
+/LIBERO-master/
+
+#python 
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+*.venv
+
+# rollout
+*rollouts/
+*logs*/
+
+# libero-plus 
+/LIBERO-plus/
+
+# checkpoints
+/ckpt

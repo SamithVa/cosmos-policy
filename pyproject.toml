@@ -120,6 +120,8 @@ libero = [
   "imageio[ffmpeg]",
   "libero",
   "mujoco==3.3.2",
+  "scikit-image",
+  "wand",
 ]
 aloha = [
   "dm_control==1.0.14",
@@ -261,6 +263,8 @@ xformers = [
   { index = "cosmos-cu128-torch27", extra = "cu128" },
   { index = "cosmos-cu130-torch29", extra = "cu130" },
 ]
+
+libero = { path = "LIBERO-plus", editable = true }
 
 [[tool.uv.index]]
 name = "cosmos-cu128-torch27"
