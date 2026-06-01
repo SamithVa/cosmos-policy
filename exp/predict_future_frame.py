@@ -34,7 +34,7 @@ EPISODE = 0
 FRAME_IDX = 50
 CHUNK_SIZE = 16
 N_CHUNKS = 20               # autoregressive queries; ~1 query advances chunk_size frames
-NUM_DENOISING_STEPS = 5    # per-query denoise steps (higher = sharper future frame, slower)
+NUM_DENOISING_STEPS = 1    # per-query denoise steps (higher = sharper future frame, slower)
 
 CKPT_PATH = "./ckpt/orange_ckpt_10k.pt"
 EXPERIMENT = "cosmos_predict2_2b_480p_lerobot"
@@ -166,18 +166,55 @@ def main():
               f"last_action={actions[-1]}")
 
     # Steady-state timing summary (skip the first query — includes CUDA warm-up / kernel compile).
-    qt = np.array(query_times)
-    if len(qt) > 1:
-        warm = qt[1:]
-        print()
-        print(f"== Inference timing summary (NUM_DENOISING_STEPS={NUM_DENOISING_STEPS}) ==")
-        print(f"  first query (cold):           {qt[0] * 1000:.0f} ms")
+    def _summarize(times, label):
+        t = np.array(times)
+        if len(t) <= 1:
+            return
+        warm = t[1:]
+        print(f"== {label} (NUM_DENOISING_STEPS={NUM_DENOISING_STEPS}) ==")
+        print(f"  first query (cold):           {t[0] * 1000:.0f} ms")
         print(f"  steady mean  (n={len(warm)}):   {warm.mean() * 1000:.0f} ms  "
               f"-> {1.0 / warm.mean():.2f} query/s  -> {CHUNK_SIZE / warm.mean():.1f} action Hz")
         print(f"  steady min:                   {warm.min() * 1000:.0f} ms  -> {CHUNK_SIZE / warm.min():.1f} action Hz")
         print(f"  steady max:                   {warm.max() * 1000:.0f} ms  -> {CHUNK_SIZE / warm.max():.1f} action Hz")
-        print("  ('action Hz' = chunk_size / query_time, i.e. effective rate if you execute")
-        print("   the full chunk open-loop before re-querying — matches num_open_loop_steps=chunk_size.)")
+
+    print()
+    _summarize(query_times, "Full-output timing (action + future frames + value)")
+    print("  ('action Hz' = chunk_size / query_time, i.e. effective rate if you execute")
+    print("   the full chunk open-loop before re-querying — matches num_open_loop_steps=chunk_size.)")
+
+    # ---------------------------------------------------------------- deployment-mode pass
+    # For real robot deployment in policy mode you don't need the future frames or the value
+    # scalar — only the action chunk. Setting `generate_future_state_and_value_in_parallel=False`
+    # skips the future-image / value extraction (and the parallel future-state denoise pass),
+    # which is the dominant chunk of per-query latency.
+    print()
+    print("Measuring deployment-mode latency (actions-only, no future frames / value)...")
+    deploy_times = []
+    for k in range(N_CHUNKS):
+        query_t = ep_start + FRAME_IDX + k * CHUNK_SIZE
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = get_action(
+            cfg=cfg,
+            model=model,
+            dataset_stats=dataset_stats,
+            obs=build_obs(ds[query_t]),
+            task_label_or_embedding=task,
+            num_denoising_steps_action=NUM_DENOISING_STEPS,
+            generate_future_state_and_value_in_parallel=False,  # actions only
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        deploy_times.append(time.perf_counter() - t0)
+    print()
+    _summarize(deploy_times, "Deployment-mode timing (actions only)")
+    if len(query_times) > 1 and len(deploy_times) > 1:
+        full = np.mean(query_times[1:])
+        deploy = np.mean(deploy_times[1:])
+        print(f"  speedup vs full output: {full / deploy:.2f}x  "
+              f"(saved {(full - deploy) * 1000:.0f} ms/query by skipping future frames + value)")
 
     all_actions = np.concatenate(all_actions, axis=0)  # (N_CHUNKS * chunk_size, 7)
     np.savetxt(OUT_ACTIONS, all_actions, fmt="%.6f",
